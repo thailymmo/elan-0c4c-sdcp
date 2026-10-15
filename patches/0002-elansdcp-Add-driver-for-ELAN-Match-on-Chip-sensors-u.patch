@@ -1,0 +1,944 @@
+From 5145fa2fbcdd1fbfd19c2b52505b789bb0b4df3b Mon Sep 17 00:00:00 2001
+From: thailymmo <lalachine2004@gmail.com>
+Date: Thu, 15 Oct 2026 21:36:03 +0700
+Subject: [PATCH 2/2] elansdcp: Add driver for ELAN Match-on-Chip sensors using
+ SDCP (04f3:0c4c)
+
+Firmware 3.05 of the ELAN 0c4c sensor only commits templates inside an
+SDCP session. The command layout (connect 0x06, reconnect 0x07, enroll
+nonce 0x09, enroll commit 0x0a, authorized identity 0x0c) was taken from
+the Windows driver; capture, identify and wipe use the existing ELAN MoC
+commands from the elanmoc2 driver.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ data/autosuspend.hwdb                 |   6 +-
+ libfprint/drivers/elansdcp/elansdcp.c | 732 ++++++++++++++++++++++++++
+ libfprint/drivers/elansdcp/elansdcp.h |  96 ++++
+ libfprint/fprint-list-udev-hwdb.c     |   1 -
+ libfprint/meson.build                 |   2 +
+ meson.build                           |   3 +
+ 6 files changed, 838 insertions(+), 2 deletions(-)
+ create mode 100644 libfprint/drivers/elansdcp/elansdcp.c
+ create mode 100644 libfprint/drivers/elansdcp/elansdcp.h
+
+diff --git a/data/autosuspend.hwdb b/data/autosuspend.hwdb
+index 31956d73..85a69280 100644
+--- a/data/autosuspend.hwdb
++++ b/data/autosuspend.hwdb
+@@ -172,6 +172,11 @@ usb:v04F3p0CB0*
+  ID_AUTOSUSPEND=1
+  ID_PERSIST=0
+ 
++# Supported by libfprint driver elansdcp
++usb:v04F3p0C4C*
++ ID_AUTOSUSPEND=1
++ ID_PERSIST=0
++
+ # Supported by libfprint driver etes603
+ usb:v1C7Ap0603*
+  ID_AUTOSUSPEND=1
+@@ -359,7 +364,6 @@ usb:v047Dp8055*
+ usb:v04E8p730B*
+ usb:v04F3p036B*
+ usb:v04F3p0C00*
+-usb:v04F3p0C4C*
+ usb:v04F3p0C57*
+ usb:v04F3p0C5E*
+ usb:v04F3p0C5A*
+diff --git a/libfprint/drivers/elansdcp/elansdcp.c b/libfprint/drivers/elansdcp/elansdcp.c
+new file mode 100644
+index 00000000..603d7a4b
+--- /dev/null
++++ b/libfprint/drivers/elansdcp/elansdcp.c
+@@ -0,0 +1,732 @@
++/*
++ * Driver for ELAN Match-on-Chip sensors using SDCP (04f3:0c4c, FW 3.05)
++ *
++ * The protocol was derived from the Windows WBF driver for this sensor
++ * (WbfUsbDriver.dll 3.2.12011.10039), which wraps the ELAN MoC command set
++ * used by the elanmoc2 driver with the Microsoft Secure Device Connection
++ * Protocol. Without an SDCP session the sensor refuses to commit templates.
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#define FP_COMPONENT "elansdcp"
++
++#include "drivers_api.h"
++#include "fpi-byte-reader.h"
++#include "elansdcp.h"
++
++G_DEFINE_TYPE (FpiDeviceElanSdcp, fpi_device_elansdcp, FP_TYPE_SDCP_DEVICE)
++
++static const FpIdEntry elansdcp_id_table[] = {
++  { .vid = 0x04f3, .pid = 0x0c4c, },
++  { .vid = 0, .pid = 0, .driver_data = 0 },
++};
++
++/* Command transport */
++
++typedef struct
++{
++  ElanSdcpCmdCallback callback;
++  guint8              ep_in;
++  gsize               in_len;
++  guint               timeout;
++  gboolean            cancellable;
++} CommandData;
++
++static void
++elansdcp_cmd_read_cb (FpiUsbTransfer *transfer,
++                      FpDevice       *device,
++                      gpointer        user_data,
++                      GError         *error)
++{
++  g_autofree CommandData *data = user_data;
++
++  if (data->callback)
++    data->callback (FPI_DEVICE_ELANSDCP (device),
++                    error ? NULL : transfer->buffer,
++                    error ? 0 : transfer->actual_length,
++                    error);
++  else if (error)
++    g_error_free (error);
++}
++
++static void
++elansdcp_cmd_write_cb (FpiUsbTransfer *transfer,
++                       FpDevice       *device,
++                       gpointer        user_data,
++                       GError         *error)
++{
++  CommandData *data = user_data;
++  FpiUsbTransfer *read;
++
++  if (error || data->in_len == 0)
++    {
++      if (data->callback)
++        data->callback (FPI_DEVICE_ELANSDCP (device), NULL, 0, error);
++      else if (error)
++        g_error_free (error);
++      g_free (data);
++      return;
++    }
++
++  read = fpi_usb_transfer_new (device);
++  read->short_is_error = FALSE;
++  fpi_usb_transfer_fill_bulk (read, data->ep_in, data->in_len);
++  fpi_usb_transfer_submit (read,
++                           data->timeout,
++                           data->cancellable ? fpi_device_get_cancellable (device) : NULL,
++                           elansdcp_cmd_read_cb,
++                           data);
++}
++
++static void
++elansdcp_cmd (FpiDeviceElanSdcp  *self,
++              guint8              code,
++              const guint8       *payload,
++              gsize               payload_len,
++              guint8              ep_in,
++              gsize               in_len,
++              guint               timeout,
++              gboolean            cancellable,
++              ElanSdcpCmdCallback callback)
++{
++  FpiUsbTransfer *write = fpi_usb_transfer_new (FP_DEVICE (self));
++  CommandData *data = g_new0 (CommandData, 1);
++
++  data->callback = callback;
++  data->ep_in = ep_in;
++  data->in_len = in_len;
++  data->timeout = timeout;
++  data->cancellable = cancellable;
++
++  fpi_usb_transfer_fill_bulk (write, ELANSDCP_EP_CMD_OUT,
++                              ELANSDCP_CMD_HDR_LEN + payload_len);
++  write->short_is_error = TRUE;
++  write->buffer[0] = 0x40;
++  write->buffer[1] = 0xff;
++  write->buffer[2] = code;
++  if (payload_len)
++    memcpy (write->buffer + ELANSDCP_CMD_HDR_LEN, payload, payload_len);
++
++  fpi_usb_transfer_submit (write, ELANSDCP_CMD_TIMEOUT, NULL,
++                           elansdcp_cmd_write_cb, data);
++}
++
++static GError *
++elansdcp_check_reply (const guint8 *data,
++                      gsize         length,
++                      gsize         min_length)
++{
++  if (length < MAX (2, min_length) || data[0] != 0x40)
++    return fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                     "Unexpected reply (%" G_GSIZE_FORMAT " bytes)",
++                                     length);
++  return NULL;
++}
++
++/* Returns a retry error for status codes asking the user to try again */
++static GError *
++elansdcp_retry_error (guint8 status)
++{
++  switch (status)
++    {
++    case ELANSDCP_RESP_MOVE_DOWN:
++    case ELANSDCP_RESP_MOVE_RIGHT:
++    case ELANSDCP_RESP_MOVE_UP:
++    case ELANSDCP_RESP_MOVE_LEFT:
++      return fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER);
++
++    case ELANSDCP_RESP_SENSOR_DIRTY:
++      return fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER);
++
++    case ELANSDCP_RESP_NOT_ENOUGH_SURFACE:
++      return fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER);
++
++    default:
++      return NULL;
++    }
++}
++
++/* Abort a pending finger wait so the sensor accepts new commands */
++static void
++elansdcp_abort_sync (FpiDeviceElanSdcp *self)
++{
++  GUsbDevice *usb = fpi_device_get_usb_device (FP_DEVICE (self));
++  guint8 cmd[] = { 0x40, 0xff, ELANSDCP_CMD_ABORT };
++  guint8 reply[2];
++  gsize len;
++
++  g_usb_device_bulk_transfer (usb, ELANSDCP_EP_CMD_OUT, cmd, sizeof (cmd), &len,
++                              ELANSDCP_CMD_TIMEOUT, NULL, NULL);
++  g_usb_device_bulk_transfer (usb, ELANSDCP_EP_CMD_IN, reply, sizeof (reply), &len,
++                              1000, NULL, NULL);
++}
++
++static void
++elansdcp_handle_cancel (FpiDeviceElanSdcp *self,
++                        GError            *error)
++{
++  if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++    elansdcp_abort_sync (self);
++}
++
++/* Open / close */
++
++static void
++elansdcp_open (FpSdcpDevice *sdcp_device)
++{
++  GError *error = NULL;
++
++  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (sdcp_device)),
++                                     0, 0, &error))
++    {
++      fpi_sdcp_device_open_complete (sdcp_device, error);
++      return;
++    }
++
++  fpi_device_set_nr_enroll_stages (FP_DEVICE (sdcp_device), ELANSDCP_ENROLL_STAGES);
++  fpi_sdcp_device_open_complete (sdcp_device, NULL);
++}
++
++static void
++elansdcp_close (FpDevice *device)
++{
++  GError *error = NULL;
++
++  g_usb_device_release_interface (fpi_device_get_usb_device (device), 0, 0, &error);
++  fpi_device_close_complete (device, error);
++}
++
++/* SDCP connect / reconnect */
++
++static void
++elansdcp_connect_cb (FpiDeviceElanSdcp *self,
++                     const guint8      *data,
++                     gsize              length,
++                     GError            *error)
++{
++  FpSdcpDevice *sdcp_device = FP_SDCP_DEVICE (self);
++  FpiByteReader reader;
++  const guint8 *p;
++  gboolean ok = TRUE;
++
++  g_autoptr(FpiSdcpClaim) claim = NULL;
++  g_autoptr(GBytes) device_random = NULL;
++  g_autoptr(GBytes) mac = NULL;
++
++  if (!error)
++    error = elansdcp_check_reply (data, length, ELANSDCP_CONNECT_RESP_LEN);
++  if (!error && data[1] != ELANSDCP_RESP_OK)
++    error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                      "SDCP connect failed with status 0x%02x", data[1]);
++  if (error)
++    {
++      fpi_sdcp_device_connect_complete (sdcp_device, NULL, NULL, NULL, error);
++      return;
++    }
++
++  claim = fpi_sdcp_claim_new ();
++  fpi_byte_reader_init (&reader, data + 2, length - 2);
++
++#define TAKE(size) (ok &= fpi_byte_reader_get_data (&reader, (size), &p), \
++                    ok ? g_bytes_new (p, (size)) : NULL)
++  device_random = TAKE (SDCP_RANDOM_SIZE);
++  claim->device_public_key = TAKE (SDCP_PUBLIC_KEY_SIZE);
++  claim->firmware_public_key = TAKE (SDCP_PUBLIC_KEY_SIZE);
++  claim->firmware_hash = TAKE (SDCP_RANDOM_SIZE);
++  mac = TAKE (SDCP_MAC_SIZE);
++  claim->model_signature = TAKE (SDCP_SIGNATURE_SIZE);
++  claim->device_signature = TAKE (SDCP_SIGNATURE_SIZE);
++  claim->model_certificate = TAKE (ELANSDCP_CERT_M_SIZE);
++#undef TAKE
++
++  if (!ok)
++    {
++      fpi_sdcp_device_connect_complete (sdcp_device, NULL, NULL, NULL,
++                                        fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                                  "SDCP connect reply too short"));
++      return;
++    }
++
++  fpi_sdcp_device_connect_complete (sdcp_device, device_random, claim, mac, NULL);
++}
++
++static void
++elansdcp_connect (FpSdcpDevice *sdcp_device)
++{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (sdcp_device);
++  guint8 payload[SDCP_RANDOM_SIZE + SDCP_PUBLIC_KEY_SIZE];
++
++  g_autoptr(GBytes) host_random = NULL;
++  g_autoptr(GBytes) host_public_key = NULL;
++
++  fpi_sdcp_device_get_connect_data (sdcp_device, &host_random, &host_public_key);
++  if (g_bytes_get_size (host_random) != SDCP_RANDOM_SIZE ||
++      g_bytes_get_size (host_public_key) != SDCP_PUBLIC_KEY_SIZE)
++    {
++      fpi_sdcp_device_connect_complete (sdcp_device, NULL, NULL, NULL,
++                                        fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++      return;
++    }
++
++  memcpy (payload, g_bytes_get_data (host_random, NULL), SDCP_RANDOM_SIZE);
++  memcpy (payload + SDCP_RANDOM_SIZE, g_bytes_get_data (host_public_key, NULL),
++          SDCP_PUBLIC_KEY_SIZE);
++
++  elansdcp_cmd (self, ELANSDCP_CMD_SDCP_CONNECT, payload, sizeof (payload),
++                ELANSDCP_EP_CMD_IN, ELANSDCP_CONNECT_RESP_LEN, ELANSDCP_CMD_TIMEOUT,
++                FALSE, elansdcp_connect_cb);
++}
++
++static void
++elansdcp_reconnect_cb (FpiDeviceElanSdcp *self,
++                       const guint8      *data,
++                       gsize              length,
++                       GError            *error)
++{
++  if (!error)
++    error = elansdcp_check_reply (data, length, 2 + SDCP_MAC_SIZE);
++  if (!error && data[1] != ELANSDCP_RESP_OK)
++    error = fpi_device_error_new (FP_DEVICE_ERROR_PROTO);
++
++  if (error)
++    {
++      fpi_sdcp_device_reconnect_complete (FP_SDCP_DEVICE (self), NULL, error);
++      return;
++    }
++
++  {
++    g_autoptr(GBytes) mac = g_bytes_new (data + 2, SDCP_MAC_SIZE);
++    fpi_sdcp_device_reconnect_complete (FP_SDCP_DEVICE (self), mac, NULL);
++  }
++}
++
++static void
++elansdcp_reconnect (FpSdcpDevice *sdcp_device)
++{
++  g_autoptr(GBytes) random = NULL;
++
++  fpi_sdcp_device_get_reconnect_data (sdcp_device, &random);
++  elansdcp_cmd (FPI_DEVICE_ELANSDCP (sdcp_device), ELANSDCP_CMD_SDCP_RECONNECT,
++                g_bytes_get_data (random, NULL), g_bytes_get_size (random),
++                ELANSDCP_EP_CMD_IN, 64, ELANSDCP_CMD_TIMEOUT, FALSE,
++                elansdcp_reconnect_cb);
++}
++
++/* The sensor does not hand out stored enrollment IDs (cmd 0x12 is refused
++ * in SDCP mode), so listing is not supported. */
++static void
++elansdcp_list (FpSdcpDevice *sdcp_device)
++{
++  fpi_sdcp_device_list_complete (sdcp_device, NULL,
++                                 fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
++}
++
++/* Enroll */
++
++static void
++elansdcp_enroll_cmd_cb (FpiDeviceElanSdcp *self,
++                        const guint8      *data,
++                        gsize              length,
++                        GError            *error)
++{
++  FpDevice *device = FP_DEVICE (self);
++  GError *retry;
++
++  if (error)
++    {
++      elansdcp_handle_cancel (self, error);
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  error = elansdcp_check_reply (data, length, 2);
++  if (error)
++    {
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  switch (fpi_ssm_get_cur_state (self->task_ssm))
++    {
++    case ENROLL_GET_COUNT:
++      self->enrolled_num = data[1];
++      fp_dbg ("Prints stored on the sensor: %d", self->enrolled_num);
++      if (self->enrolled_num >= ELANSDCP_MAX_PRINTS)
++        {
++          fpi_ssm_mark_failed (self->task_ssm,
++                               fpi_device_error_new (FP_DEVICE_ERROR_DATA_FULL));
++          return;
++        }
++      self->enroll_stage = 0;
++      fpi_ssm_next_state (self->task_ssm);
++      break;
++
++    case ENROLL_CAPTURE:
++      if (data[1] == ELANSDCP_RESP_OK)
++        {
++          self->enroll_stage++;
++          fpi_device_enroll_progress (device, self->enroll_stage, NULL, NULL);
++          if (self->enroll_stage < ELANSDCP_ENROLL_STAGES)
++            fpi_ssm_jump_to_state (self->task_ssm, ENROLL_CAPTURE);
++          else
++            fpi_ssm_next_state (self->task_ssm);
++        }
++      else if ((retry = elansdcp_retry_error (data[1])))
++        {
++          fpi_device_enroll_progress (device, self->enroll_stage, NULL, retry);
++          fpi_ssm_jump_to_state (self->task_ssm, ENROLL_CAPTURE);
++        }
++      else
++        {
++          fpi_ssm_mark_failed (self->task_ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Enroll failed with status 0x%02x",
++                                                         data[1]));
++        }
++      break;
++
++    case ENROLL_GET_NONCE:
++      if (data[1] != ELANSDCP_RESP_OK || length < 2 + SDCP_NONCE_SIZE)
++        {
++          fpi_ssm_mark_failed (self->task_ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Could not get enrollment nonce"));
++          return;
++        }
++      /* The SSM ends here; the commit runs through the SDCP callbacks */
++      fpi_ssm_mark_completed (g_steal_pointer (&self->task_ssm));
++      {
++        g_autoptr(GBytes) nonce = g_bytes_new (data + 2, SDCP_NONCE_SIZE);
++        fpi_sdcp_device_enroll_commit (FP_SDCP_DEVICE (self), nonce, NULL);
++      }
++      break;
++    }
++}
++
++static void
++elansdcp_enroll_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (device);
++  guint8 enroll_args[4];
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case ENROLL_GET_COUNT:
++      elansdcp_cmd (self, ELANSDCP_CMD_ENROLLED_COUNT, NULL, 0, ELANSDCP_EP_CMD_IN, 64,
++                    ELANSDCP_CMD_TIMEOUT, FALSE, elansdcp_enroll_cmd_cb);
++      break;
++
++    case ENROLL_CAPTURE:
++      enroll_args[0] = self->enrolled_num;
++      enroll_args[1] = ELANSDCP_ENROLL_STAGES;
++      enroll_args[2] = self->enroll_stage;
++      enroll_args[3] = 0;
++      fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
++      elansdcp_cmd (self, ELANSDCP_CMD_ENROLL, enroll_args, sizeof (enroll_args),
++                    ELANSDCP_EP_MOC_IN, 64, 0, TRUE, elansdcp_enroll_cmd_cb);
++      break;
++
++    case ENROLL_GET_NONCE:
++      fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
++      elansdcp_cmd (self, ELANSDCP_CMD_SDCP_ENROLL_NONCE, NULL, 0, ELANSDCP_EP_CMD_IN, 64,
++                    ELANSDCP_CMD_TIMEOUT, FALSE, elansdcp_enroll_cmd_cb);
++      break;
++    }
++}
++
++static void
++elansdcp_enroll_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
++{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (device);
++
++  self->task_ssm = NULL;
++  fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
++  if (error)
++    fpi_device_enroll_complete (device, NULL, error);
++}
++
++static void
++elansdcp_enroll (FpSdcpDevice *sdcp_device)
++{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (sdcp_device);
++
++  g_assert_null (self->task_ssm);
++  self->task_ssm = fpi_ssm_new (FP_DEVICE (self), elansdcp_enroll_run_state,
++                                ENROLL_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, elansdcp_enroll_ssm_done);
++}
++
++static void
++elansdcp_enroll_commit_cb (FpiDeviceElanSdcp *self,
++                           const guint8      *data,
++                           gsize              length,
++                           GError            *error)
++{
++  if (!error)
++    error = elansdcp_check_reply (data, length, 2);
++  if (!error && data[1] != ELANSDCP_RESP_OK)
++    error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                      "Enroll commit failed with status 0x%02x", data[1]);
++
++  fpi_sdcp_device_enroll_commit_complete (FP_SDCP_DEVICE (self), error);
++}
++
++static void
++elansdcp_enroll_commit (FpSdcpDevice *sdcp_device,
++                        GBytes       *id)
++{
++  elansdcp_cmd (FPI_DEVICE_ELANSDCP (sdcp_device), ELANSDCP_CMD_SDCP_ENROLL_COMMIT,
++                g_bytes_get_data (id, NULL), g_bytes_get_size (id),
++                ELANSDCP_EP_CMD_IN, 64, ELANSDCP_CMD_TIMEOUT, FALSE,
++                elansdcp_enroll_commit_cb);
++}
++
++/* Identify / verify */
++
++static void
++elansdcp_identify_finish (FpiDeviceElanSdcp *self)
++{
++  FpDevice *device = FP_DEVICE (self);
++
++  if (fpi_device_get_current_action (device) == FPI_DEVICE_ACTION_VERIFY)
++    fpi_device_verify_complete (device, NULL);
++  else
++    fpi_device_identify_complete (device, NULL);
++}
++
++static void
++elansdcp_identify_cmd_cb (FpiDeviceElanSdcp *self,
++                          const guint8      *data,
++                          gsize              length,
++                          GError            *error)
++{
++  FpSdcpDevice *sdcp_device = FP_SDCP_DEVICE (self);
++  GError *retry;
++
++  if (error)
++    {
++      elansdcp_handle_cancel (self, error);
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  error = elansdcp_check_reply (data, length, 2);
++  if (error)
++    {
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  switch (fpi_ssm_get_cur_state (self->task_ssm))
++    {
++    case IDENTIFY_WAIT_FINGER:
++      fpi_device_report_finger_status (FP_DEVICE (self), FP_FINGER_STATUS_PRESENT);
++      if (data[1] == ELANSDCP_RESP_NOT_MATCHED)
++        {
++          fpi_ssm_mark_completed (g_steal_pointer (&self->task_ssm));
++          fpi_sdcp_device_identify_complete (sdcp_device, NULL, NULL, NULL);
++        }
++      else if ((retry = elansdcp_retry_error (data[1])))
++        {
++          fpi_ssm_mark_completed (g_steal_pointer (&self->task_ssm));
++          fpi_sdcp_device_identify_retry (sdcp_device, retry);
++          elansdcp_identify_finish (self);
++        }
++      else if (data[1] < ELANSDCP_MAX_PRINTS)
++        {
++          fp_dbg ("Sensor matched slot %d", data[1]);
++          fpi_ssm_next_state (self->task_ssm);
++        }
++      else
++        {
++          fpi_ssm_mark_failed (self->task_ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Identify failed with status 0x%02x",
++                                                         data[1]));
++        }
++      break;
++
++    case IDENTIFY_GET_AUTHORIZED_ID:
++      if (data[1] != ELANSDCP_RESP_OK || length < 2 + SDCP_ENROLLMENT_ID_SIZE + SDCP_MAC_SIZE)
++        {
++          fpi_ssm_mark_failed (self->task_ssm,
++                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                                         "Could not get authorized identity"));
++          return;
++        }
++      fpi_ssm_mark_completed (g_steal_pointer (&self->task_ssm));
++      {
++        g_autoptr(GBytes) id = g_bytes_new (data + 2, SDCP_ENROLLMENT_ID_SIZE);
++        g_autoptr(GBytes) mac = g_bytes_new (data + 2 + SDCP_ENROLLMENT_ID_SIZE,
++                                             SDCP_MAC_SIZE);
++        fpi_sdcp_device_identify_complete (sdcp_device, id, mac, NULL);
++      }
++      break;
++    }
++}
++
++static void
++elansdcp_identify_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (device);
++
++  g_autoptr(GBytes) nonce = NULL;
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case IDENTIFY_WAIT_FINGER:
++      fpi_device_report_finger_status (device, FP_FINGER_STATUS_NEEDED);
++      elansdcp_cmd (self, ELANSDCP_CMD_IDENTIFY, NULL, 0, ELANSDCP_EP_MOC_IN, 64, 0, TRUE,
++                    elansdcp_identify_cmd_cb);
++      break;
++
++    case IDENTIFY_GET_AUTHORIZED_ID:
++      fpi_device_report_finger_status (device, FP_FINGER_STATUS_NONE);
++      fpi_sdcp_device_get_identify_data (FP_SDCP_DEVICE (self), &nonce);
++      elansdcp_cmd (self, ELANSDCP_CMD_SDCP_AUTHORIZED_ID,
++                    g_bytes_get_data (nonce, NULL), g_bytes_get_size (nonce),
++                    ELANSDCP_EP_CMD_IN, 64 + 2, ELANSDCP_CMD_TIMEOUT, FALSE,
++                    elansdcp_identify_cmd_cb);
++      break;
++    }
++}
++
++static void
++elansdcp_identify_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
++{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (device);
++
++  self->task_ssm = NULL;
++  if (error)
++    fpi_sdcp_device_identify_complete (FP_SDCP_DEVICE (device), NULL, NULL, error);
++}
++
++static void
++elansdcp_identify (FpSdcpDevice *sdcp_device)
++{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (sdcp_device);
++
++  g_assert_null (self->task_ssm);
++  self->task_ssm = fpi_ssm_new (FP_DEVICE (self), elansdcp_identify_run_state,
++                                IDENTIFY_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, elansdcp_identify_ssm_done);
++}
++
++/* Clear storage */
++
++static void
++elansdcp_clear_storage_cb (FpiDeviceElanSdcp *self,
++                           const guint8      *data,
++                           gsize              length,
++                           GError            *error)
++{
++  if (error)
++    {
++      fpi_ssm_mark_failed (self->task_ssm, error);
++      return;
++    }
++
++  if (fpi_ssm_get_cur_state (self->task_ssm) == CLEAR_STORAGE_WIPE)
++    {
++      fpi_ssm_next_state (self->task_ssm);
++      return;
++    }
++
++  error = elansdcp_check_reply (data, length, 2);
++  if (!error && data[1] != 0)
++    error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
++                                      "Sensor still reports %d prints after wipe", data[1]);
++  if (error)
++    fpi_ssm_mark_failed (self->task_ssm, error);
++  else
++    fpi_ssm_mark_completed (self->task_ssm);
++}
++
++static void
++elansdcp_clear_storage_run_state (FpiSsm *ssm, FpDevice *device)
++{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (device);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case CLEAR_STORAGE_WIPE:
++      /* No reply; the sensor is busy for about 5 seconds afterwards */
++      elansdcp_cmd (self, ELANSDCP_CMD_WIPE, NULL, 0, 0, 0, ELANSDCP_CMD_TIMEOUT, FALSE,
++                    elansdcp_clear_storage_cb);
++      break;
++
++    case CLEAR_STORAGE_CHECK:
++      elansdcp_cmd (self, ELANSDCP_CMD_ENROLLED_COUNT, NULL, 0, ELANSDCP_EP_CMD_IN, 64,
++                    ELANSDCP_WIPE_TIMEOUT, FALSE, elansdcp_clear_storage_cb);
++      break;
++    }
++}
++
++static void
++elansdcp_clear_storage_ssm_done (FpiSsm *ssm, FpDevice *device, GError *error)
++{
++  FPI_DEVICE_ELANSDCP (device)->task_ssm = NULL;
++  fpi_device_clear_storage_complete (device, error);
++}
++
++static void
++elansdcp_clear_storage (FpDevice *device)
++{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (device);
++
++  g_assert_null (self->task_ssm);
++  self->task_ssm = fpi_ssm_new (device, elansdcp_clear_storage_run_state,
++                                CLEAR_STORAGE_NUM_STATES);
++  fpi_ssm_start (self->task_ssm, elansdcp_clear_storage_ssm_done);
++}
++
++static void
++fpi_device_elansdcp_init (FpiDeviceElanSdcp *self)
++{
++}
++
++static void
++fpi_device_elansdcp_class_init (FpiDeviceElanSdcpClass *klass)
++{
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++  FpSdcpDeviceClass *sdcp_class = FP_SDCP_DEVICE_CLASS (klass);
++
++  dev_class->id = FP_COMPONENT;
++  dev_class->full_name = "ELAN Match-on-Chip (SDCP)";
++  dev_class->type = FP_DEVICE_TYPE_USB;
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++  dev_class->id_table = elansdcp_id_table;
++  dev_class->nr_enroll_stages = ELANSDCP_ENROLL_STAGES;
++  dev_class->temp_hot_seconds = -1;
++
++  dev_class->close = elansdcp_close;
++  dev_class->clear_storage = elansdcp_clear_storage;
++
++  sdcp_class->open = elansdcp_open;
++  sdcp_class->connect = elansdcp_connect;
++  sdcp_class->reconnect = elansdcp_reconnect;
++  sdcp_class->list = elansdcp_list;
++  sdcp_class->enroll = elansdcp_enroll;
++  sdcp_class->enroll_commit = elansdcp_enroll_commit;
++  sdcp_class->identify = elansdcp_identify;
++
++  fpi_device_class_auto_initialize_features (dev_class);
++  /* Templates live on the sensor, but stored IDs cannot be listed and the
++   * single-print delete command (0x05) does not reliably select a print,
++   * so only wiping the whole storage is offered. */
++  dev_class->features &= ~FP_DEVICE_FEATURE_STORAGE_LIST;
++  dev_class->features |= FP_DEVICE_FEATURE_STORAGE;
++}
+diff --git a/libfprint/drivers/elansdcp/elansdcp.h b/libfprint/drivers/elansdcp/elansdcp.h
+new file mode 100644
+index 00000000..ca85482c
+--- /dev/null
++++ b/libfprint/drivers/elansdcp/elansdcp.h
+@@ -0,0 +1,96 @@
++/*
++ * Driver for ELAN Match-on-Chip sensors using SDCP (04f3:0c4c, FW 3.05)
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#pragma once
++
++#include "fpi-device.h"
++#include "fpi-sdcp-device.h"
++#include "fpi-ssm.h"
++
++#define ELANSDCP_EP_CMD_OUT (0x01 | FPI_USB_ENDPOINT_OUT)
++#define ELANSDCP_EP_CMD_IN (0x03 | FPI_USB_ENDPOINT_IN)
++#define ELANSDCP_EP_MOC_IN (0x04 | FPI_USB_ENDPOINT_IN)
++
++#define ELANSDCP_CMD_TIMEOUT 5000
++#define ELANSDCP_WIPE_TIMEOUT 10000
++#define ELANSDCP_ENROLL_STAGES 8
++#define ELANSDCP_MAX_PRINTS 10
++
++/* Every command is 0x40 0xff <code> [payload] */
++#define ELANSDCP_CMD_HDR_LEN 3
++
++#define ELANSDCP_CMD_ENROLL 0x01
++#define ELANSDCP_CMD_ABORT 0x02
++#define ELANSDCP_CMD_IDENTIFY 0x03
++#define ELANSDCP_CMD_ENROLLED_COUNT 0x04
++#define ELANSDCP_CMD_SDCP_CONNECT 0x06
++#define ELANSDCP_CMD_SDCP_RECONNECT 0x07
++#define ELANSDCP_CMD_SDCP_ENROLL_NONCE 0x09
++#define ELANSDCP_CMD_SDCP_ENROLL_COMMIT 0x0a
++#define ELANSDCP_CMD_SDCP_AUTHORIZED_ID 0x0c
++#define ELANSDCP_CMD_WIPE 0x99
++
++/* Status byte (second byte of every reply) */
++#define ELANSDCP_RESP_OK 0x00
++#define ELANSDCP_RESP_MOVE_DOWN 0x41
++#define ELANSDCP_RESP_MOVE_RIGHT 0x42
++#define ELANSDCP_RESP_MOVE_UP 0x43
++#define ELANSDCP_RESP_MOVE_LEFT 0x44
++#define ELANSDCP_RESP_SENSOR_DIRTY 0xfb
++#define ELANSDCP_RESP_NOT_MATCHED 0xfd
++#define ELANSDCP_RESP_NOT_ENOUGH_SURFACE 0xfe
++
++/* r_d | pk_d | pk_f | h_f | mac | s_m | s_d | cert_m */
++#define ELANSDCP_CERT_M_SIZE 846
++#define ELANSDCP_CONNECT_RESP_LEN (2 + SDCP_RANDOM_SIZE + 2 * SDCP_PUBLIC_KEY_SIZE + \
++                                   SDCP_RANDOM_SIZE + SDCP_MAC_SIZE + \
++                                   2 * SDCP_SIGNATURE_SIZE + ELANSDCP_CERT_M_SIZE)
++
++G_DECLARE_FINAL_TYPE (FpiDeviceElanSdcp, fpi_device_elansdcp, FPI, DEVICE_ELANSDCP, FpSdcpDevice)
++
++typedef void (*ElanSdcpCmdCallback) (FpiDeviceElanSdcp *self,
++                                     const guint8      *data,
++                                     gsize              length,
++                                     GError            *error);
++
++enum enroll_states {
++  ENROLL_GET_COUNT,
++  ENROLL_CAPTURE,
++  ENROLL_GET_NONCE,
++  ENROLL_NUM_STATES,
++};
++
++enum identify_states {
++  IDENTIFY_WAIT_FINGER,
++  IDENTIFY_GET_AUTHORIZED_ID,
++  IDENTIFY_NUM_STATES,
++};
++
++enum clear_storage_states {
++  CLEAR_STORAGE_WIPE,
++  CLEAR_STORAGE_CHECK,
++  CLEAR_STORAGE_NUM_STATES,
++};
++
++struct _FpiDeviceElanSdcp
++{
++  FpSdcpDevice parent;
++  FpiSsm      *task_ssm;
++  guint8       enrolled_num;
++  guint8       enroll_stage;
++};
+diff --git a/libfprint/fprint-list-udev-hwdb.c b/libfprint/fprint-list-udev-hwdb.c
+index 6e2adb04..a60d6101 100644
+--- a/libfprint/fprint-list-udev-hwdb.c
++++ b/libfprint/fprint-list-udev-hwdb.c
+@@ -36,7 +36,6 @@ static const FpIdEntry allowlist_id_table[] = {
+   { .vid = 0x04e8, .pid = 0x730b },
+   { .vid = 0x04f3, .pid = 0x036b },
+   { .vid = 0x04f3, .pid = 0x0c00 },
+-  { .vid = 0x04f3, .pid = 0x0c4c },
+   { .vid = 0x04f3, .pid = 0x0c57 },
+   { .vid = 0x04f3, .pid = 0x0c5e },
+   { .vid = 0x04f3, .pid = 0x0c5a },
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index 81fcdc95..40c8c9a1 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -128,6 +128,8 @@ driver_sources = {
+         [ 'drivers/egis0570.c' ],
+     'egismoc' :
+         [ 'drivers/egismoc/egismoc.c' ],
++    'elansdcp' :
++        [ 'drivers/elansdcp/elansdcp.c' ],
+     'vfs0050' :
+         [ 'drivers/vfs0050.c' ],
+     'elan' :
+diff --git a/meson.build b/meson.build
+index 4968167e..428e704f 100644
+--- a/meson.build
++++ b/meson.build
+@@ -131,6 +131,7 @@ default_drivers = [
+     'etes603',
+     'egis0570',
+     'egismoc',
++    'elansdcp',
+     'vcom5s',
+     'synaptics',
+     'elan',
+@@ -166,6 +167,7 @@ endian_independent_drivers = virtual_drivers + [
+     'egis0570',
+     'egismoc',
+     'elanmoc',
++    'elansdcp',
+     'etes603',
+     'focaltech_moc',
+     'nb1010',
+@@ -210,6 +212,7 @@ driver_helper_mapping = {
+     'aes3500' : [ 'aeslib', 'aes3k' ],
+     'aes4000' : [ 'aeslib', 'aes3k' ],
+     'egismoc' : [ 'sdcp' ],
++    'elansdcp' : [ 'sdcp' ],
+     'elanspi' : [ 'udev' ],
+     'uru4000' : [ 'openssl' ],
+     'virtual_image'          : [ 'virtual' ],
+-- 
+2.56.0
+

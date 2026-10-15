@@ -1,0 +1,69 @@
+diff --git a/Components/Input.qml b/Components/Input.qml
+index a980e1b..0ac8c7d 100644
+--- a/Components/Input.qml
++++ b/Components/Input.qml
+@@ -15,6 +15,14 @@ Column {
+     property ComboBox exposeSession: sessionSelect.exposeSession
+     property bool failed
+ 
++    // An empty password hands the login over to the fingerprint reader
++    function doLogin() {
++        if (password.text === "")
++            fingerprint.wait()
++        var user = config.AllowUppercaseLettersInUsernames == "false" ? username.text.toLowerCase() : username.text
++        sddm.login(user, password.text, sessionSelect.selectedSession)
++    }
++
+     Item {
+         id: errorMessageField
+ 
+@@ -242,7 +250,7 @@ Column {
+                 radius: config.RoundCorners || 0
+             }
+             
+-            onAccepted: config.AllowUppercaseLettersInUsernames == "false" ? sddm.login(username.text.toLowerCase(), password.text, sessionSelect.selectedSession) : sddm.login(username.text, password.text, sessionSelect.selectedSession)
++            onAccepted: inputContainer.doLogin()
+             KeyNavigation.down: passwordIcon
+ 
+             states: [
+@@ -369,7 +377,7 @@ Column {
+                 border.width: parent.activeFocus ? 2 : 1
+                 radius: config.RoundCorners || 0
+             }
+-            onAccepted: config.AllowUppercaseLettersInUsernames == "false" ? sddm.login(username.text.toLowerCase(), password.text, sessionSelect.selectedSession) : sddm.login(username.text, password.text, sessionSelect.selectedSession)
++            onAccepted: inputContainer.doLogin()
+             KeyNavigation.down: loginButton
+         }
+ 
+@@ -397,6 +405,10 @@ Column {
+         ]        
+     }
+ 
++    FingerprintHint {
++        id: fingerprint
++    }
++
+     Item {
+         id: login
+ 
+@@ -502,7 +514,7 @@ Column {
+                 }
+             ]
+ 
+-            onClicked: config.AllowUppercaseLettersInUsernames == "false" ? sddm.login(username.text.toLowerCase(), password.text, sessionSelect.selectedSession) : sddm.login(username.text, password.text, sessionSelect.selectedSession)
++            onClicked: inputContainer.doLogin()
+             Keys.onReturnPressed: clicked()
+             Keys.onEnterPressed: clicked()
+             
+@@ -512,8 +524,10 @@ Column {
+ 
+     Connections {
+         target: sddm
+-        function onLoginSucceeded() {}
++        function onLoginSucceeded() { fingerprint.done(true) }
+         function onLoginFailed() {
++            if (fingerprint.state_ === "waiting")
++                fingerprint.done(false)
+             failed = true
+             resetError.running ? resetError.stop() && resetError.start() : resetError.start()
+         }

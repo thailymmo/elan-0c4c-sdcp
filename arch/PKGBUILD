@@ -1,0 +1,45 @@
+# libfprint with SDCP support and the elansdcp driver for ELAN 04f3:0c4c
+# (HP ENVY x360 15 / Spectre x360 and other laptops with this sensor).
+#
+# Builds the upstream feature/sdcp-v2 branch plus the patches in ./patches.
+
+pkgname=libfprint-elansdcp-git
+_pkgname=libfprint
+_sdcp_commit=2d7c5277de08c6b29b3fac7447f17a516fbc4d1c
+pkgver=1.94.10
+pkgrel=1
+pkgdesc="Fingerprint reader library with SDCP and the elansdcp driver for ELAN 04f3:0c4c"
+arch=(x86_64)
+url="https://github.com/thailymmo/elan-0c4c-sdcp"
+license=(LGPL-2.1-or-later)
+depends=(glib2 libgusb libgudev nss openssl pixman systemd-libs)
+makedepends=(git meson gobject-introspection)
+provides=("libfprint=$pkgver" libfprint-2.so)
+conflicts=(libfprint)
+source=("$_pkgname::git+https://gitlab.freedesktop.org/libfprint/libfprint.git#commit=$_sdcp_commit"
+        0001-sdcp-Fix-double-free-on-certificate-verification-fai.patch
+        0002-elansdcp-Add-driver-for-ELAN-Match-on-Chip-sensors-u.patch)
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+prepare() {
+  cd $_pkgname
+  git -c user.name=makepkg -c user.email=makepkg@localhost \
+    am "$srcdir"/0001-*.patch "$srcdir"/0002-*.patch
+}
+
+pkgver() {
+  cd $_pkgname
+  printf "1.94.10.r%s.g%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  arch-meson $_pkgname build \
+    -D doc=false \
+    -D installed-tests=false \
+    -D gtk-examples=false
+  meson compile -C build
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}
