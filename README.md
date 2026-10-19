@@ -68,6 +68,12 @@ sudo pacman -S libfprint   # back to the stock library
   "clear storage") removes prints enrolled by other systems.
 - The Windows driver may delete prints it does not know about when you enroll
   in Windows Hello. Re-run `fprintd-enroll` if Linux stops recognizing you.
+- **Booting Windows can switch the sensor to another mode** (Windows Hello with
+  VBS). In that mode enrollment reports success but nothing is stored and no
+  finger ever matches. The driver now sends `set_mode 03` every time the device
+  is opened, so update to the latest patch and enroll again with
+  `fprintd-enroll`. If you do not need fingerprints on Windows, disabling the
+  ELAN sensor in Windows Device Manager (Biometric devices) avoids the problem.
 - This depends on libfprint's SDCP branch, which is not merged upstream yet.
 
 ## How it works
@@ -120,5 +126,10 @@ ký ngón trỏ phải.
 - **Bộ nhớ chip (khoảng 10 vân tay) dùng chung cho mọi hệ điều hành trên máy,
   kể cả Windows Hello.** Xóa toàn bộ bộ nhớ chip sẽ xóa luôn vân tay của các
   hệ khác.
+- **Khởi động Windows có thể chuyển cảm biến sang chế độ khác** (Windows Hello
+  với VBS). Khi đó đăng ký báo thành công nhưng không lưu, quét không bao giờ
+  khớp. Driver giờ gửi `set_mode 03` mỗi lần mở thiết bị: cập nhật bản vá mới
+  nhất rồi chạy lại `fprintd-enroll`. Nếu không cần vân tay trên Windows, hãy
+  Disable cảm biến ELAN trong Device Manager (Biometric devices).
 - Chưa hỗ trợ xóa hoặc liệt kê từng vân tay trên chip.
 - Gỡ cài đặt: `sudo bash scripts/setup-pam.sh --undo` rồi `sudo pacman -S libfprint`.

@@ -29,7 +29,7 @@ real hardware. The model certificate is `CN=Secure BIO Sensor`, issued by
 | `0a` | SDCP enroll commit | `id(32)`, `id = HMAC(s, "enroll\0" + nonce)` | - |
 | `0c` | SDCP authorized identity | `nonce(32)` | `id(32) mac(32)`, `mac = HMAC(s, "identify\0" + nonce + id)` |
 | `0d` | application key (Windows only) | - | 64 bytes |
-| `14` | set mode | `mode` | - |
+| `14` | set sensor mode | `mode` (Linux uses `03`) | - |
 | `99` | wipe all templates | - | no reply; sensor busy ~5 s |
 
 The key schedule is standard SDCP: ECDH(P-256) with `pk_f`, then KBKDF-HMAC-SHA256
@@ -40,3 +40,8 @@ over the full 846-byte `cert_m` field.
 
 Template storage is shared by every OS on the machine (about 10 slots), including
 Windows Hello. Wiping the sensor removes prints enrolled by other systems.
+
+The sensor mode persists across reboots. Windows (`OnSetFWSensorMode`, VBS
+mode) can leave the sensor in a mode where enroll/commit return `40 00` but the
+template count does not change and identify always returns `fd`. Sending
+`40 ff 14 03` restores normal operation; the driver does this on open.

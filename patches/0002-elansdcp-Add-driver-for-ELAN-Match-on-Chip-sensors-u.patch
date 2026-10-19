@@ -1,4 +1,4 @@
-From 5145fa2fbcdd1fbfd19c2b52505b789bb0b4df3b Mon Sep 17 00:00:00 2001
+From e9bfeda614090e7dcfb9cd43511ee55cffec8726 Mon Sep 17 00:00:00 2001
 From: thailymmo <lalachine2004@gmail.com>
 Date: Thu, 15 Oct 2026 21:36:03 +0700
 Subject: [PATCH 2/2] elansdcp: Add driver for ELAN Match-on-Chip sensors using
@@ -13,12 +13,12 @@ commands from the elanmoc2 driver.
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
  data/autosuspend.hwdb                 |   6 +-
- libfprint/drivers/elansdcp/elansdcp.c | 732 ++++++++++++++++++++++++++
- libfprint/drivers/elansdcp/elansdcp.h |  96 ++++
+ libfprint/drivers/elansdcp/elansdcp.c | 753 ++++++++++++++++++++++++++
+ libfprint/drivers/elansdcp/elansdcp.h | 101 ++++
  libfprint/fprint-list-udev-hwdb.c     |   1 -
  libfprint/meson.build                 |   2 +
  meson.build                           |   3 +
- 6 files changed, 838 insertions(+), 2 deletions(-)
+ 6 files changed, 864 insertions(+), 2 deletions(-)
  create mode 100644 libfprint/drivers/elansdcp/elansdcp.c
  create mode 100644 libfprint/drivers/elansdcp/elansdcp.h
 
@@ -48,10 +48,10 @@ index 31956d73..85a69280 100644
  usb:v04F3p0C5A*
 diff --git a/libfprint/drivers/elansdcp/elansdcp.c b/libfprint/drivers/elansdcp/elansdcp.c
 new file mode 100644
-index 00000000..603d7a4b
+index 00000000..d8d5761b
 --- /dev/null
 +++ b/libfprint/drivers/elansdcp/elansdcp.c
-@@ -0,0 +1,732 @@
+@@ -0,0 +1,753 @@
 +/*
 + * Driver for ELAN Match-on-Chip sensors using SDCP (04f3:0c4c, FW 3.05)
 + *
@@ -239,8 +239,26 @@ index 00000000..603d7a4b
 +/* Open / close */
 +
 +static void
++elansdcp_set_mode_cb (FpiDeviceElanSdcp *self,
++                      const guint8      *data,
++                      gsize              length,
++                      GError            *error)
++{
++  if (!error)
++    error = elansdcp_check_reply (data, length, 2);
++  if (!error && data[1] != ELANSDCP_RESP_OK)
++    error = fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
++                                      "Setting the sensor mode failed with status 0x%02x",
++                                      data[1]);
++
++  fpi_sdcp_device_open_complete (FP_SDCP_DEVICE (self), error);
++}
++
++static void
 +elansdcp_open (FpSdcpDevice *sdcp_device)
 +{
++  FpiDeviceElanSdcp *self = FPI_DEVICE_ELANSDCP (sdcp_device);
++  const guint8 mode = ELANSDCP_SENSOR_MODE;
 +  GError *error = NULL;
 +
 +  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (sdcp_device)),
@@ -251,7 +269,10 @@ index 00000000..603d7a4b
 +    }
 +
 +  fpi_device_set_nr_enroll_stages (FP_DEVICE (sdcp_device), ELANSDCP_ENROLL_STAGES);
-+  fpi_sdcp_device_open_complete (sdcp_device, NULL);
++
++  /* The mode survives reboots, so restore it every time */
++  elansdcp_cmd (self, ELANSDCP_CMD_SET_MODE, &mode, 1, ELANSDCP_EP_CMD_IN, 64,
++                ELANSDCP_CMD_TIMEOUT, FALSE, elansdcp_set_mode_cb);
 +}
 +
 +static void
@@ -786,10 +807,10 @@ index 00000000..603d7a4b
 +}
 diff --git a/libfprint/drivers/elansdcp/elansdcp.h b/libfprint/drivers/elansdcp/elansdcp.h
 new file mode 100644
-index 00000000..ca85482c
+index 00000000..630e5b5f
 --- /dev/null
 +++ b/libfprint/drivers/elansdcp/elansdcp.h
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,101 @@
 +/*
 + * Driver for ELAN Match-on-Chip sensors using SDCP (04f3:0c4c, FW 3.05)
 + *
@@ -835,7 +856,12 @@ index 00000000..ca85482c
 +#define ELANSDCP_CMD_SDCP_ENROLL_NONCE 0x09
 +#define ELANSDCP_CMD_SDCP_ENROLL_COMMIT 0x0a
 +#define ELANSDCP_CMD_SDCP_AUTHORIZED_ID 0x0c
++#define ELANSDCP_CMD_SET_MODE 0x14
 +#define ELANSDCP_CMD_WIPE 0x99
++
++/* Sensor mode used by Linux; Windows Hello in VBS mode leaves the sensor in
++ * another mode where enrollments are not stored and never match. */
++#define ELANSDCP_SENSOR_MODE 0x03
 +
 +/* Status byte (second byte of every reply) */
 +#define ELANSDCP_RESP_OK 0x00
